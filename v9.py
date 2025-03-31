@@ -14,7 +14,6 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler
 )
-from cachetools import TTLCache
 import redis
 from typing import Dict, List, Optional
 
@@ -26,19 +25,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DATABASE_NAME = 'v2.db'
-JSON_DATA_SOURCE = 'input.json'
+JSON_DATA_SOURCE = 'allbooksv2.json'
 MAX_MESSAGE_LENGTH = 4096  # الحد الأقصى لطول رسالة التليجرام
-
-CACHE_CONFIG = {
-    'maxsize': 1000,
-    'ttl': 300  # 5 دقائق
-}
 
 SEARCH_CONFIG = {
     'result_limit': 5,
     'max_display': 20,
     'min_query_length': 1,
-    'rate_limit': 15  # عدد الطلبات المسموح بها لكل دقيقة
+    'rate_limit': 2000  # عدد الطلبات المسموح بها لكل دقيقة
 }
 
 REDIS_CONFIG = {
@@ -69,42 +63,49 @@ class HadithDatabase:
             self.conn.row_factory = sqlite3.Row
             self._initialize_database()
             
-        except Exception as e:
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"فشل الاتصال بـ Redis: {str(e)}")
+            raise
+        except sqlite3.Error as e:
             logger.error(f"فشل في تهيئة قاعدة البيانات: {str(e)}")
             raise
 
     def _initialize_database(self):
         """تهيئة الجداول والفهارس"""
-        with self.conn:
-            # جدول الأحاديث الأساسي
-            self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS hadiths (
-                    id INTEGER PRIMARY KEY,
-                    book TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    grading TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
-            
-            # جدول البحث الفوري
-            self.conn.execute('''
-                CREATE VIRTUAL TABLE IF NOT EXISTS hadiths_fts 
-                USING fts5(text, content='hadiths')''')
-            
-            # جدول الإحصائيات
-            self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS stats (
-                    type TEXT PRIMARY KEY,
-                    count INTEGER DEFAULT 0,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
-            
-            # فهارس لتحسين الأداء
-            self.conn.execute('CREATE INDEX IF NOT EXISTS idx_book ON hadiths(book)')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS idx_created ON hadiths(created_at)')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS idx_book_grading ON hadiths(book, grading)')
-            
-        self._load_initial_data()
+        try:
+            with self.conn:
+                # جدول الأحاديث الأساسي
+                self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS hadiths (
+                        id INTEGER PRIMARY KEY,
+                        book TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        grading TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                
+                # جدول البحث الفوري
+                self.conn.execute('''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS hadiths_fts 
+                    USING fts5(text, content='hadiths', tokenize='unicode61')''') # تحسين الفهرسة
+                
+                # جدول الإحصائيات
+                self.conn.execute('''
+                    CREATE TABLE IF NOT EXISTS stats (
+                        type TEXT PRIMARY KEY,
+                        count INTEGER DEFAULT 0,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
+                
+                # فهارس لتحسين الأداء
+                self.conn.execute('CREATE INDEX IF NOT EXISTS idx_book ON hadiths(book)')
+                self.conn.execute('CREATE INDEX IF NOT EXISTS idx_created ON hadiths(created_at)')
+                self.conn.execute('CREATE INDEX IF NOT EXISTS idx_book_grading ON hadiths(book, grading)')
+                
+            self._load_initial_data()
+        except sqlite3.Error as e:
+            logger.error(f"خطأ في تهيئة قاعدة البيانات: {str(e)}")
+            raise
     
     def _load_initial_data(self):
         """تحميل البيانات الأولية من ملف JSON"""
@@ -118,47 +119,74 @@ class HadithDatabase:
                 self._import_data(data)
                 logger.info("تم استيراد البيانات بنجاح")
                 
+        except FileNotFoundError:
+            logger.error(f'لم يتم العثور على ملف البيانات: {JSON_DATA_SOURCE}')
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f'خطأ في تنسيق JSON: {str(e)}')
+            raise
+        except sqlite3.Error as e:
+            logger.error(f'خطأ في قاعدة البيانات أثناء تحميل البيانات: {str(e)}')
+            raise
         except Exception as e:
-            logger.error(f'خطأ في تحميل البيانات: {str(e)}')
+            logger.error(f'خطأ غير متوقع أثناء تحميل البيانات: {str(e)}')
             raise
     
     def _import_data(self, data: List[Dict]):
         """استيراد البيانات إلى قاعدة البيانات"""
-        with self.conn:
-            # تفريغ الجداول
-            self.conn.execute('DELETE FROM hadiths')
-            self.conn.execute('DELETE FROM hadiths_fts')
-            self.conn.execute('DELETE FROM stats')
-            
-            batch = []
-            for item in data:
-                clean_text = self._sanitize_text(item.get('arabicText', ''))
-                batch.append((
-                    item.get('book', 'غير معروف'),
-                    clean_text,
-                    item.get('majlisiGrading', 'غير مصنف')
-                ))
+        try:
+            with self.conn:
+                # تفريغ الجداول
+                self.conn.execute('DELETE FROM hadiths')
+                self.conn.execute('DELETE FROM hadiths_fts')
+                self.conn.execute('DELETE FROM stats')
                 
-                if len(batch) >= 500:
+                batch = []
+                for item in data:
+                    clean_text = self._sanitize_text(item.get('arabicText', ''))
+                    batch.append((
+                        item.get('book', 'غير معروف'),
+                        clean_text,
+                        item.get('majlisiGrading', 'غير مصنف')
+                    ))
+                    
+                    if len(batch) >= 500:
+                        self._insert_batch(batch)
+                        batch = []
+                
+                if batch:
                     self._insert_batch(batch)
-                    batch = []
             
-            if batch:
-                self._insert_batch(batch)
-            
-            # تحديث فهرس البحث
-            self.conn.execute('''
-                INSERT INTO hadiths_fts (rowid, text)
-                SELECT id, text FROM hadiths
-            ''')
-            self.conn.execute('INSERT INTO hadiths_fts(hadiths_fts) VALUES(\'rebuild\')')
-            
+                # try catch block for handling exceptions
+                try:
+                    # تحديث فهرس البحث
+                    self.conn.execute('''
+                        INSERT INTO hadiths_fts (rowid, text)
+                        SELECT id, text FROM hadiths
+                    ''')
+                    self.conn.execute('INSERT INTO hadiths_fts(hadiths_fts) VALUES(\'rebuild\')')
+                except sqlite3.Error as e:
+                    logger.error(f'Error updating FTS index: {e}')
+                    raise
+                
+        except sqlite3.Error as e:
+            logger.error(f'خطأ في استيراد البيانات: {str(e)}')
+            raise
+        except Exception as e:
+            logger.error(f'خطأ غير متوقع أثناء الاستيراد: {str(e)}')
+            raise
+    
     def _insert_batch(self, batch: List[tuple]):
         """إدخال دفعة من البيانات"""
-        self.conn.executemany('''
-            INSERT INTO hadiths (book, text, grading)
-            VALUES (?, ?, ?)
-        ''', batch)
+        try:
+            with self.conn:
+                self.conn.executemany('''
+                    INSERT INTO hadiths (book, text, grading)
+                    VALUES (?, ?, ?)
+                ''', batch)
+        except sqlite3.Error as e:
+                logger.error(f'Error inserting batch: {e}')
+                raise
     
     def _sanitize_text(self, text: str) -> str:
         """تنظيف النص من التشكيل والأخطاء"""
@@ -188,16 +216,20 @@ class HadithDatabase:
         cache_key = f'search:{normalized_query}'
         
         # التحقق من التخزين المؤقت أولاً
-        if cached := self.redis.get(cache_key):
-            return json.loads(cached)
-            
+        try:
+            if cached := self.redis.get(cache_key):
+                return json.loads(cached)
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"Redis connection error: {e}, skipping cache")
+            # Consider whether to raise the exception or proceed without cache
+        
         terms = []
         for term in normalized_query.split():
             term = term.strip()
             if not term:
                 continue
                 
-            # معالجة الواو باحترافية
+            # معالجة الواو
             if term.startswith('و'):
                 variants = [term, term[1:]] if len(term) > 1 else [term]
             else:
@@ -213,7 +245,7 @@ class HadithDatabase:
         try:
             with self.conn:
                 results = self.conn.execute('''
-                    SELECT book, text, grading 
+                    SELECT id, book, text, grading 
                     FROM hadiths
                     WHERE id IN (
                         SELECT rowid 
@@ -226,10 +258,13 @@ class HadithDatabase:
                 
                 # تحويل النتائج إلى قواميس وتخزينها في Redis
                 results_dict = [dict(row) for row in results]
-                self.redis.setex(cache_key, 300, json.dumps(results_dict))
+                try:
+                  self.redis.setex(cache_key, 300, json.dumps(results_dict))
+                except redis.exceptions.ConnectionError as e:
+                    logger.error(f"Redis connection error: {e}, cannot set cache")
                 return results_dict
                 
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f'خطأ في البحث: {str(e)}')
             return []
     
@@ -254,16 +289,18 @@ class HadithDatabase:
                             last_updated = CURRENT_TIMESTAMP
                     ''', (stat_type, count))
                     
-        except Exception as e:
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f'Redis connection error: {e}, skipping stats update')
+        except sqlite3.Error as e:
             logger.error(f'خطأ في تحديث الإحصائيات: {str(e)}')
-    
+
     def get_statistics(self) -> Dict[str, int]:
         """استرجاع الإحصائيات من SQLite"""
         try:
             with self.conn:
                 return {row['type']: row['count'] 
                         for row in self.conn.execute('SELECT type, count FROM stats')}
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f'خطأ في استرجاع الإحصائيات: {str(e)}')
             return {}
 
@@ -277,6 +314,8 @@ class HadithDatabase:
                 elif op['type'] == 'set':
                     pipe.set(op['key'], op['value'], ex=op.get('ttl'))
             pipe.execute()
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f'Redis connection error: {e}, bulk_update failed')
         except Exception as e:
             logger.error(f'خطأ في bulk_update: {str(e)}')
 
@@ -286,10 +325,14 @@ db = HadithDatabase()
 async def check_rate_limit(user_id: int) -> bool:
     """التحقق من معدل الطلبات للمستخدم"""
     key = f"ratelimit:{user_id}"
-    current = db.redis.incr(key)
-    if current == 1:
-        db.redis.expire(key, 60)
-    return current > SEARCH_CONFIG['rate_limit']
+    try:
+        current = db.redis.incr(key)
+        if current == 1:
+            db.redis.expire(key, 60)
+        return current > SEARCH_CONFIG['rate_limit']
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Redis connection error: {e}, rate limit check failed.  Allowing request.")
+        return False # Important:  Return False, to not block user.
 
 def split_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> List[str]:
     """تقسيم النص الطويل إلى أجزاء"""
@@ -394,18 +437,21 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not results:
             await update.message.reply_html("⚠️ لم يتم العثور على نتائج")
             return
-            
+        
+        # اصلاح هنا
         if total > SEARCH_CONFIG['max_display']:
             await update.message.reply_html(
                 f"<b>⚠️ تم العثور على {total} نتيجة!</b>\n"
                 "الرجاء تضييق نطاق البحث بإضافة كلمات أخرى."
+                f"<a href='https://www.google.com/search?q={query}'>بحث في جوجل</a>"
+                ,disable_web_page_preview=True
             )
             return
             
         response = [f"<b>🔍 تم العثور على {total} نتيجة:</b>\n"]
         
         # تحليل السياق
-        for idx, hadith in enumerate(results[:10], 1):
+        for idx, hadith in enumerate(results[:10], 1): #show only top 10 in preview
             text = hadith['text']
             match_index = text.find(query)
             
@@ -442,7 +488,8 @@ async def real_time_analytics():
     """مهمة خلفية لمعالجة التحليلات في الوقت الحقيقي"""
     while True:
         try:
-            messages = db.redis.xread({'analytics_stream': '$'}, block=0, count=10)
+            # استخدام count=100 لتجميع المزيد من الرسائل في كل مرة.
+            messages = db.redis.xread({'analytics_stream': '$'}, block=0, count=100)
             for stream, message_list in messages:
                 for message_id, message_data in message_list:
                     # معالجة البيانات التحليلية
@@ -450,6 +497,9 @@ async def real_time_analytics():
                     db.redis.xdel('analytics_stream', message_id)
                     
             await asyncio.sleep(5)
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"Redis connection error in real_time_analytics: {e}")
+            await asyncio.sleep(10)  # Wait and try again.  Consider a circuit breaker.
         except Exception as e:
             logger.error(f"خطأ في real_time_analytics: {str(e)}")
             await asyncio.sleep(10)
@@ -459,7 +509,9 @@ def initialize_bot():
     """تهيئة وتشغيل البوت"""
     try:
         # الحصول على التوكن من متغيرات البيئة
-        token = os.getenv('BOT_TOKEN', '7378891608:AAGEYCS7lCgukX8Uqg9vH1HLMWjiX-C4HXg')
+        token = os.getenv('BOT_TOKEN', '7378891608:AAGEYCS7lCgukX8Uqg9vH1HLMWjiX-C4HXg') # Replace with a default value or raise an error
+        if not token:
+            raise ValueError("BOT_TOKEN environment variable is not set.")
         
         application = Application.builder().token(token).build()
         
@@ -486,6 +538,9 @@ def initialize_bot():
             drop_pending_updates=True
         )
         
+    except ValueError as e:
+        logger.critical(f"Configuration error: {e}")
+        # Consider a more graceful exit or retry mechanism
     except Exception as e:
         logger.critical(f"فشل في تشغيل البوت: {str(e)}")
 
