@@ -12,10 +12,11 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    CallbackQueryHandler
+    CallbackQueryHandler,
+    CallbackQuery
 )
 import redis
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------- إعدادات النظام ----------------------
 logging.basicConfig(
@@ -25,14 +26,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DATABASE_NAME = 'v2.db'
-JSON_DATA_SOURCE = 'allbooksv2.json'
+JSON_DATA_SOURCE = 'input.json'
 MAX_MESSAGE_LENGTH = 4096  # الحد الأقصى لطول رسالة التليجرام
 
 SEARCH_CONFIG = {
     'result_limit': 5,
     'max_display': 20,
     'min_query_length': 1,
-    'rate_limit': 2000  # عدد الطلبات المسموح بها لكل دقيقة
+    'rate_limit': 15,  # عدد الطلبات المسموح بها لكل دقيقة
+    'max_snippet_length': 100  # الحد الأقصى لطول المقتطف
 }
 
 REDIS_CONFIG = {
@@ -84,10 +86,16 @@ class HadithDatabase:
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )''')
                 
-                # جدول البحث الفوري
+                # جدول البحث الفوري باستخدام FTS5 مع تحسينات للغة العربية
                 self.conn.execute('''
                     CREATE VIRTUAL TABLE IF NOT EXISTS hadiths_fts 
-                    USING fts5(text, content='hadiths', tokenize='unicode61')''') # تحسين الفهرسة
+                    USING fts5(
+                        id,  -- تضمين id في الفهرس
+                        text, 
+                        content='hadiths', 
+                        tokenize='unicode61',
+                        prefix='1 2 3'  -- دعم البحث عن الكلمات التي تبدأ بـ حرفين أو ثلاثة
+                    )''')
                 
                 # جدول الإحصائيات
                 self.conn.execute('''
@@ -161,8 +169,8 @@ class HadithDatabase:
                 try:
                     # تحديث فهرس البحث
                     self.conn.execute('''
-                        INSERT INTO hadiths_fts (rowid, text)
-                        SELECT id, text FROM hadiths
+                        INSERT INTO hadiths_fts (rowid, id, text)
+                        SELECT id, id, text FROM hadiths
                     ''')
                     self.conn.execute('INSERT INTO hadiths_fts(hadiths_fts) VALUES(\'rebuild\')')
                 except sqlite3.Error as e:
@@ -204,7 +212,7 @@ class HadithDatabase:
     
     def search_hadiths(self, query: str) -> List[Dict]:
         """
-        بحث متقدم مع معالجة خاصة للواو والتطبيع العربي
+        بحث متقدم مع معالجة خاصة للواو والتطبيع العربي وتصحيح الأخطاء الإملائية.
         
         Args:
             query (str): نص البحث
@@ -228,13 +236,16 @@ class HadithDatabase:
             term = term.strip()
             if not term:
                 continue
-                
-            # معالجة الواو
+            
+            # التعامل مع الواو
             if term.startswith('و'):
                 variants = [term, term[1:]] if len(term) > 1 else [term]
             else:
                 variants = [term, f'و{term}']
-                
+            
+             # تصحيح الأخطاء الإملائية باستخدام Levenshtein distance (تقريبي)
+            variants.extend(self._correct_spelling(term))
+            
             terms.append(f'({" OR ".join(variants)})')
         
         if not terms:
@@ -259,7 +270,7 @@ class HadithDatabase:
                 # تحويل النتائج إلى قواميس وتخزينها في Redis
                 results_dict = [dict(row) for row in results]
                 try:
-                  self.redis.setex(cache_key, 300, json.dumps(results_dict))
+                    self.redis.setex(cache_key, 300, json.dumps(results_dict))
                 except redis.exceptions.ConnectionError as e:
                     logger.error(f"Redis connection error: {e}, cannot set cache")
                 return results_dict
@@ -267,6 +278,44 @@ class HadithDatabase:
         except sqlite3.Error as e:
             logger.error(f'خطأ في البحث: {str(e)}')
             return []
+    
+    def _correct_spelling(self, term: str, max_distance: int = 2) -> List[str]:
+        """تصحيح الأخطاء الإملائية باستخدام Levenshtein distance."""
+        # This is a simplified version.  For a real application, use a proper dictionary.
+        #  and a more efficient algorithm (like a BK-tree).
+        
+        # Example:  A very basic "dictionary" of common Arabic words in your domain.
+        dictionary = ["شيعة", "باهتوهم", "الكافي", "عيون", "أخبار", "الرضا", "نهج", "البلاغة", "الخصال",
+                      "الأمالي", "التوحيد", "فضائل", "كامل", "الزيارات", "الضعفاء", "الغيبة", "المؤمن",
+                      "الزهد", "معاني", "الأخبار", "معجم", "الأحاديث", "المعتبرة", "رسالة", "الحقوق"]
+        
+        suggestions = []
+        for word in dictionary:
+            distance = self._levenshtein_distance(term, word)
+            if distance <= max_distance:
+                suggestions.append(word)
+        return suggestions
+    
+    @staticmethod
+    def _levenshtein_distance(s1: str, s2: str) -> int:
+        """Calculate Levenshtein distance between two strings."""
+        # Efficient implementation (using only two rows of the matrix)
+        if len(s1) < len(s2):
+            return HadithDatabase._levenshtein_distance(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = list(range(len(s2) + 1))
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        return previous_row[-1]
     
     def update_statistics(self, stat_type: str):
         """تحديث الإحصائيات باستخدام Redis"""
@@ -358,22 +407,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     أنا بوت كاشف أحاديث الشيعة في قاعدة بياناتي اكثر من 26155 حديث 🔍</b>
 
     <i>مميزات البوت:</i>
-    - كتاب الكافي للكليني مع التصحيح من مراة العقول للمجلسي
-    - جميع الاحاديث الموجودة في عيون اخبار الرضا للصدوق
+    - كتاب الكافي للكليني مع التصحيح من مرآة العقول للمجلسي
+    - جميع الأحاديث الموجودة في عيون أخبار الرضا للصدوق
     - كتاب نهج البلاغة
     - كتاب الخصال للصدوق 
-    - وسيتم اضافة باقي كتب الشيعة
-    - كتاب الامالي للصدوق
-    - كتاب الامالي للمفيد
+    - وسيتم إضافة باقي كتب الشيعة
+    - كتاب الأمالي للصدوق
+    - كتاب الأمالي للمفيد
     - كتاب التوحيد للصدوق
     - كتاب فضائل الشيعة للصدوق
     - كتاب كامل الزيارات لابن قولويه القمي
     - كتاب الضعفاء لابن الغضائري
     - كتاب الغيبة للنعماني
     - كتاب الغيبة للطوسي
-    - كتاب المؤمن لحسين بن سعيد الكوفي الاهوازي
-    - كتاب الزهد لحسين بن سعيد الكوفي الاهوازي
-    - كتاب معاني الاخبار للصدوق
+    - كتاب المؤمن لحسين بن سعيد الكوفي الأهوازي
+    - كتاب الزهد لحسين بن سعيد الكوفي الأهوازي
+    - كتاب معاني الأخبار للصدوق
     - كتاب معجم الأحاديث المعتبرة لمحمد أصفر محسني
     - كتاب نهج البلاغة لعلي بن أبي طالب
     - كتاب رسالة الحقوق للإمام زين العابدين
@@ -420,15 +469,15 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await check_rate_limit(user.id):
             await update.message.reply_text("⏳ تم تجاوز الحد المسموح من الطلبات! الرجاء الانتظار...")
             return
-            
+        
         if not update.message.text.startswith('شيعة'):
             return
-            
+        
         query = update.message.text[4:].strip()
         if not query or len(query) < SEARCH_CONFIG['min_query_length']:
             await update.message.reply_text("⚠️ الرجاء إدخال نص للبحث (3 أحرف على الأقل)")
             return
-            
+        
         db.update_statistics('search')
         
         results = db.search_hadiths(query)
@@ -442,47 +491,93 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total > SEARCH_CONFIG['max_display']:
             await update.message.reply_html(
                 f"<b>⚠️ تم العثور على {total} نتيجة!</b>\n"
-                "الرجاء تضييق نطاق البحث بإضافة كلمات أخرى."
-                f"<a href='https://www.google.com/search?q={query}'>بحث في جوجل</a>"
-                ,disable_web_page_preview=True
+                "الرجاء تضييق نطاق البحث بإضافة كلمات أخرى.\n"
+                f"<a href='https://www.google.com/search?q={query}'>بحث في جوجل</a>",
+                disable_web_page_preview=True
             )
             return
-            
+        
         response = [f"<b>🔍 تم العثور على {total} نتيجة:</b>\n"]
         
-        # تحليل السياق
-        for idx, hadith in enumerate(results[:10], 1): #show only top 10 in preview
-            text = hadith['text']
-            match_index = text.find(query)
+        sent_hadith_ids = set()  # تتبع الأحاديث المرسلة
+        for idx, hadith in enumerate(results[:SEARCH_CONFIG['max_display']], 1):
+            if hadith['id'] in sent_hadith_ids:
+                continue  # تخطي الأحاديث المكررة
+            sent_hadith_ids.add(hadith['id'])
             
-            if match_index != -1:
-                start = max(0, match_index - 20)
-                end = min(len(text), match_index + 50)
-                snippet = text[start:end].replace(query, f"<b>{query}</b>")
+            text = hadith['text']
+            # تسليط الضوء على الكلمات المفتاحية في المقتطف
+            snippet = highlight_keywords(text, query)
+            
+            if len(text) > MAX_MESSAGE_LENGTH:
+                # تقسيم الحديث الطويل وإرسال الجزء الأول مع زر "للمزيد"
+                first_part = text[:MAX_MESSAGE_LENGTH]
+                keyboard = [[InlineKeyboardButton(
+                    "➕ للمزيد", callback_data=f"hadith_more:{hadith['id']}"
+                )]]
+                response.append(
+                    f"{idx}. {snippet}...\n"
+                    f"📚 الكتاب: {hadith['book']}\n"
+                    f"📌 صحة الحديث: {hadith['grading']}\n"
+                )
+                await update.message.reply_html('\n'.join(response), reply_markup=InlineKeyboardMarkup(keyboard))
+                await asyncio.sleep(0.2)
+                response = [] # clear response
+            else:
                 response.append(
                     f"{idx}. {snippet}\n"
                     f"📚 الكتاب: {hadith['book']}\n"
                     f"📌 صحة الحديث: {hadith['grading']}\n"
                 )
         
-        # إرسال النتائج الكاملة إذا كانت ضمن الحد
-        if total <= SEARCH_CONFIG['result_limit']:
-            for hadith in results:
-                message = (
-                    f"<b>📖 {hadith['book']}</b>\n\n"
-                    f"{hadith['text']}\n\n"
-                    f"<i>صحة الحديث: {hadith['grading']}</i>"
-                )
-                for part in split_text(message):
-                    await update.message.reply_html(part)
-                    await asyncio.sleep(0.1)
-        else:
-            response.append("\n<b>ℹ️ الرجاء إضافة كلمات أخرى من المتن للحصول على نتائج أدق.</b>")
+        if response:
             await update.message.reply_html('\n'.join(response))
-            
+        
     except Exception as e:
         logger.error(f"خطأ في handle_search: {str(e)}")
         await update.message.reply_text("❌ حدث خطأ أثناء معالجة طلبك")
+
+async def hadith_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الضغط على زر "للمزيد" لعرض الجزء الثاني من الحديث"""
+    query = update.callback_query
+    hadith_id = query.data.split(":")[1]
+    
+    try:
+        with db.conn:
+        # Fetch the full hadith text using the id.
+            cursor = db.conn.execute("SELECT text FROM hadiths WHERE id = ?", (hadith_id,))
+            result = cursor.fetchone()
+        if result:
+            full_text = result[0]
+            if len(full_text) > MAX_MESSAGE_LENGTH:
+                second_part = full_text[MAX_MESSAGE_LENGTH:]
+                await query.message.reply_html(f"<b>الجزء الثاني:</b>\n{second_part}")
+            else:
+                await query.message.reply_text("الحديث غير مقسم.")
+        else:
+            await query.message.reply_text("لم يتم العثور على الحديث.")
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching full hadith text: {e}")
+        await query.message.reply_text("Failed to retrieve the full hadith.")
+    await query.answer()
+
+def highlight_keywords(text: str, query: str) -> str:
+    """تسليط الضوء على الكلمات المفتاحية في النص"""
+    normalized_query = db.normalize_arabic(query)
+    for term in normalized_query.split():
+        term = term.strip()
+        if not term:
+            continue
+        # handle wa حرف
+        if term.startswith('و'):
+            variants = [term, term[1:]] if len(term) > 1 else [term]
+        else:
+            variants = [term, f'و{term}']
+        
+        for variant in variants:
+            # Use re.IGNORECASE for case-insensitive matching
+            text = re.sub(r'(?i)' + re.escape(variant), r'<b>\g<0></b>', text)
+    return text
 
 async def real_time_analytics():
     """مهمة خلفية لمعالجة التحليلات في الوقت الحقيقي"""
@@ -495,7 +590,7 @@ async def real_time_analytics():
                     # معالجة البيانات التحليلية
                     logger.info(f"تحليل بيانات: {message_data}")
                     db.redis.xdel('analytics_stream', message_id)
-                    
+            
             await asyncio.sleep(5)
         except redis.exceptions.ConnectionError as e:
             logger.error(f"Redis connection error in real_time_analytics: {e}")
@@ -518,6 +613,7 @@ def initialize_bot():
         # إضافة معالجات الأوامر
         application.add_handler(CommandHandler('start', start_command))
         application.add_handler(CommandHandler('help', help_command))
+        application.add_handler(CallbackQueryHandler(hadith_more_callback, pattern=r"^hadith_more:"))
         
         # إضافة معالجات الرسائل
         application.add_handler(MessageHandler(
