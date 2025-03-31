@@ -1,5 +1,2 @@
-aiogram
-asyncio
-cachetools
-python-telegram-bot
-redis
+python-telegram-bot==22.0
+redis==5.2.1
